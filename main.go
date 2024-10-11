@@ -8,22 +8,36 @@
 package main
 
 import (
+	"encoding/csv"
+
+	b64 "encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"runtime"
-	"strconv"
+
+	"net"
+	"net/http"
 
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/ipc"
-	"golang.zx2c4.com/wireguard/tun"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/caarlos0/env/v11"
 )
 
 const (
 	ExitSetupSuccess = 0
 	ExitSetupFailed  = 1
+)
+
+const (
+	CONN_HOST = "[::]"
+	CONN_PORT = "3333"
+	CONN_TYPE = "tcp"
 )
 
 const (
@@ -109,37 +123,6 @@ func main() {
 		return device.LogLevelError
 	}()
 
-	// open TUN device (or use supplied fd)
-
-	tdev, err := func() (tun.Device, error) {
-		tunFdStr := os.Getenv(ENV_WG_TUN_FD)
-		if tunFdStr == "" {
-			return tun.CreateTUN(interfaceName, device.DefaultMTU)
-		}
-
-		// construct tun device from supplied fd
-
-		fd, err := strconv.ParseUint(tunFdStr, 10, 32)
-		if err != nil {
-			return nil, err
-		}
-
-		err = unix.SetNonblock(int(fd), true)
-		if err != nil {
-			return nil, err
-		}
-
-		file := os.NewFile(uintptr(fd), "")
-		return tun.CreateTUNFromFile(file, device.DefaultMTU)
-	}()
-
-	if err == nil {
-		realInterfaceName, err2 := tdev.Name()
-		if err2 == nil {
-			interfaceName = realInterfaceName
-		}
-	}
-
 	logger := device.NewLogger(
 		logLevel,
 		fmt.Sprintf("(%s) ", interfaceName),
@@ -147,33 +130,30 @@ func main() {
 
 	logger.Verbosef("Starting wireguard-go version %s", Version)
 
-	if err != nil {
-		logger.Errorf("Failed to create TUN device: %v", err)
-		os.Exit(ExitSetupFailed)
-	}
+	/*
+		// open UAPI file (or use supplied fd)
 
-	// open UAPI file (or use supplied fd)
+		fileUAPI, err := func() (*os.File, error) {
+			uapiFdStr := os.Getenv(ENV_WG_UAPI_FD)
+			if uapiFdStr == "" {
+				return ipc.UAPIOpen(interfaceName)
+			}
 
-	fileUAPI, err := func() (*os.File, error) {
-		uapiFdStr := os.Getenv(ENV_WG_UAPI_FD)
-		if uapiFdStr == "" {
-			return ipc.UAPIOpen(interfaceName)
-		}
+			// use supplied fd
 
-		// use supplied fd
+			fd, err := strconv.ParseUint(uapiFdStr, 10, 32)
+			if err != nil {
+				return nil, err
+			}
 
-		fd, err := strconv.ParseUint(uapiFdStr, 10, 32)
+			return os.NewFile(uintptr(fd), ""), nil
+		}()
 		if err != nil {
-			return nil, err
+			logger.Errorf("UAPI listen error: %v", err)
+			os.Exit(ExitSetupFailed)
+			return
 		}
-
-		return os.NewFile(uintptr(fd), ""), nil
-	}()
-	if err != nil {
-		logger.Errorf("UAPI listen error: %v", err)
-		os.Exit(ExitSetupFailed)
-		return
-	}
+	*/
 	// daemonize the process
 
 	if !foreground {
@@ -196,8 +176,7 @@ func main() {
 				files[0], // stdin
 				files[1], // stdout
 				files[2], // stderr
-				tdev.File(),
-				fileUAPI,
+				//				fileUAPI,
 			},
 			Dir: ".",
 			Env: env,
@@ -222,14 +201,68 @@ func main() {
 		return
 	}
 
-	device := device.NewDevice(tdev, conn.NewDefaultBind(), logger)
+	var config device.EnvConfig
+	if err := env.Parse(&config); err != nil {
+		fmt.Println(err)
+	}
+
+	dev := device.NewDevice(conn.NewDefaultBind(), logger, &config)
+	if dev == nil {
+		panic("could not set up device")
+	}
+	if config.PeersCsv != "" {
+		fd, err := os.Open(config.PeersCsv)
+		if err != nil {
+			panic(err)
+		}
+		reader := csv.NewReader(fd)
+		reader.Comment = '#'
+		for {
+			fields, err := reader.Read()
+			if err == io.EOF {
+				break
+			}
+
+			publicKeyBytes, err := b64.StdEncoding.DecodeString(fields[1])
+			if err != nil {
+				panic(err)
+			}
+
+			var publicKey device.NoisePublicKey
+			copy(publicKey[:], publicKeyBytes)
+			//err := publicKey.From(value)
+			if err != nil {
+				panic(fmt.Errorf("failed to get peer by public key: %w", err))
+			}
+			if peer, err := dev.NewPeer(publicKey); err != nil {
+				panic(fmt.Errorf("failed to create new peer: %w", err))
+			} else {
+				peer.Start()
+			}
+
+		}
+		fd.Close()
+	} else if !config.OpenPeering {
+		panic("Open Peering Policy is disabled and CSV file with static peers is not defined")
+	}
+
+	dev.BindUpdate()
 
 	logger.Verbosef("Device started")
 
 	errs := make(chan error)
 	term := make(chan os.Signal, 1)
 
-	uapi, err := ipc.UAPIListen(interfaceName, fileUAPI)
+	http.Handle("/metrics", promhttp.Handler())
+	go func() {
+		http.ListenAndServe(config.PromListenAddress, nil)
+	}()
+
+	/*
+		//someone pls tell me how to pass an listening fd to a process to be started
+		uapi, err := ipc.UAPIListen(interfaceName, fileUAPI)
+	*/
+	uapi, err := net.Listen(CONN_TYPE, CONN_HOST+":"+CONN_PORT)
 	if err != nil {
 		logger.Errorf("Failed to listen on uapi socket: %v", err)
 		os.Exit(ExitSetupFailed)
@@ -242,7 +275,7 @@ func main() {
 				errs <- err
 				return
 			}
-			go device.IpcHandle(conn)
+			go dev.IpcHandle(conn)
 		}
 	}()
 
@@ -256,13 +289,13 @@ func main() {
 	select {
 	case <-term:
 	case <-errs:
-	case <-device.Wait():
+	case <-dev.Wait():
 	}
 
 	// clean up
 
 	uapi.Close()
-	device.Close()
+	dev.Close()
 
 	logger.Verbosef("Shutting down")
 }

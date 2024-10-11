@@ -17,6 +17,8 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
+	pb "golang.zx2c4.com/wireguard/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type QueueHandshakeElement struct {
@@ -376,8 +378,20 @@ func (device *Device) RoutineHandshake(id int) {
 			// update endpoint
 			peer.SetEndpointFromPacket(elem.endpoint)
 
-			device.log.Verbosef("%v - Received handshake initiation", peer)
+			device.log.Verbosef("%v - Received handshake initiation %v", peer, elem.endpoint.DstToString())
+
+			// update prometheus metrics
 			peer.rxBytes.Add(uint64(len(elem.packet)))
+			device.metricsHandshakesTotal.Inc()
+
+			// send evend notification
+			endpointAddressAsBytes := elem.endpoint.DstToBytes()
+			device.GrpcServer.PeerSeenEventCh <- &pb.PeerSeenEvent{
+				PublicKey:  peer.handshake.remoteStatic[:],
+				Endpoint:   endpointAddressAsBytes[:len(endpointAddressAsBytes)-2],
+				Timestamp:  timestamppb.Now(),
+				UpdateType: pb.UpdateType_Handshake,
+			}
 
 			peer.SendHandshakeResponse()
 
@@ -467,7 +481,18 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
 
 			if len(elem.packet) == 0 {
-				device.log.Verbosef("%v - Receiving keepalive packet", peer)
+				device.log.Verbosef("%v - Receiving keepalive packet from src address %v", peer, elem.endpoint.DstToString())
+				// update prometheus metrics
+				device.metricsKeepalivesTotal.Inc()
+
+				// send evend notification
+				endpointAddressAsBytes := elem.endpoint.DstToBytes()
+				device.GrpcServer.PeerSeenEventCh <- &pb.PeerSeenEvent{
+					PublicKey:  peer.handshake.remoteStatic[:],
+					Endpoint:   endpointAddressAsBytes[:len(endpointAddressAsBytes)-2],
+					Timestamp:  timestamppb.Now(),
+					UpdateType: pb.UpdateType_Keepalive,
+				}
 				continue
 			}
 			dataPacketReceived = true
@@ -484,10 +509,10 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				}
 				elem.packet = elem.packet[:length]
 				src := elem.packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]
-				if device.allowedips.Lookup(src) != peer {
-					device.log.Verbosef("IPv4 packet with disallowed source address from %v", peer)
-					continue
-				}
+				device.log.Verbosef("IPv4 packet with disallowed source address from %v: %v", peer, src)
+				device.metricsDiscardedPackets.WithLabelValues("ipv4").Add(1)
+				peer.rxDiscardedIpv4Packets.Add(1)
+				continue
 
 			case 6:
 				if len(elem.packet) < ipv6.HeaderLen {
@@ -501,17 +526,17 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				}
 				elem.packet = elem.packet[:length]
 				src := elem.packet[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]
-				if device.allowedips.Lookup(src) != peer {
-					device.log.Verbosef("IPv6 packet with disallowed source address from %v", peer)
-					continue
-				}
+				device.log.Verbosef("IPv6 packet with disallowed source address from %v: %v", peer, src)
+				device.metricsDiscardedPackets.WithLabelValues("ipv6").Add(1)
+				peer.rxDiscardedIpv6Packets.Add(1)
+				continue
 
 			default:
 				device.log.Verbosef("Packet with invalid IP version from %v", peer)
+				device.metricsDiscardedPackets.WithLabelValues("unknown").Add(1)
 				continue
 			}
 
-			bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
 		}
 
 		peer.rxBytes.Add(rxBytesLen)
@@ -523,12 +548,6 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		}
 		if dataPacketReceived {
 			peer.timersDataReceived()
-		}
-		if len(bufs) > 0 {
-			_, err := device.tun.device.Write(bufs, MessageTransportOffsetContent)
-			if err != nil && !device.isClosed() {
-				device.log.Errorf("Failed to write packets to TUN device: %v", err)
-			}
 		}
 		for _, elem := range elemsContainer.elems {
 			device.PutMessageBuffer(elem.buffer)

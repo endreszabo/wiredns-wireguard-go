@@ -1,0 +1,8 @@
+dinnyes.eu.				      6000 IN SOA	ns1.y7.hu. ns1.y7.hu. 2024082414 28800 7200 604800 600
+dinnyes.eu.				      6000 IN NS	ns1.y7.hu.
+dinnyes.eu.				      6000 IN NS	ns2.y7.hu.
+dinnyes.eu.				      6000 IN A		195.216.251.99
+dinnyes.eu.				      6000 IN MX	10 cyberhole.inx.hu.
+www.dinnyes.eu.				      6000 IN A		195.216.251.99
+www.dinnyes.eu.				      6000 IN TXT	"lofasz"
+www.dinnyes.eu.				      6000 IN TXT	"lofasz2"

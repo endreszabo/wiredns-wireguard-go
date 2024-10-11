@@ -11,32 +11,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.zx2c4.com/wireguard/conn"
+	pb "golang.zx2c4.com/wireguard/proto"
 	"golang.zx2c4.com/wireguard/ratelimiter"
 	"golang.zx2c4.com/wireguard/rwcancel"
-	"golang.zx2c4.com/wireguard/tun"
 )
 
 type Device struct {
-	state struct {
-		// state holds the device's state. It is accessed atomically.
-		// Use the device.deviceState method to read it.
-		// device.deviceState does not acquire the mutex, so it captures only a snapshot.
-		// During state transitions, the state variable is updated before the device itself.
-		// The state is thus either the current state of the device or
-		// the intended future state of the device.
-		// For example, while executing a call to Up, state will be deviceStateUp.
-		// There is no guarantee that that intended future state of the device
-		// will become the actual state; Up can fail.
-		// The device can also change state multiple times between time of check and time of use.
-		// Unsynchronized uses of state must therefore be advisory/best-effort only.
-		state atomic.Uint32 // actually a deviceState, but typed uint32 for convenience
-		// stopping blocks until all inputs to Device have been closed.
-		stopping sync.WaitGroup
-		// mu protects state changes.
-		sync.Mutex
-	}
-
 	net struct {
 		stopping sync.WaitGroup
 		sync.RWMutex
@@ -63,7 +46,6 @@ type Device struct {
 		limiter        ratelimiter.Ratelimiter
 	}
 
-	allowedips    AllowedIPs
 	indexTable    IndexTable
 	cookieChecker CookieChecker
 
@@ -81,113 +63,35 @@ type Device struct {
 		handshake  *handshakeQueue
 	}
 
-	tun struct {
-		device tun.Device
-		mtu    atomic.Int32
-	}
-
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
 	log      *Logger
+
+	metricsPeersCountTotal  prometheus.GaugeFunc
+	metricsPeersActiveTotal prometheus.GaugeFunc
+	metricsHandshakesTotal  prometheus.Counter
+	metricsKeepalivesTotal  prometheus.Counter
+	metricsDiscardedPackets *prometheus.CounterVec
+
+	EnvConfig  *EnvConfig
+	GrpcServer *EventServer
 }
 
-// deviceState represents the state of a Device.
-// There are three states: down, up, closed.
-// Transitions:
-//
-//	down -----+
-//	  ↑↓      ↓
-//	  up -> closed
-type deviceState uint32
-
-//go:generate go run golang.org/x/tools/cmd/stringer -type deviceState -trimprefix=deviceState
-const (
-	deviceStateDown deviceState = iota
-	deviceStateUp
-	deviceStateClosed
-)
-
-// deviceState returns device.state.state as a deviceState
-// See those docs for how to interpret this value.
-func (device *Device) deviceState() deviceState {
-	return deviceState(device.state.state.Load())
-}
-
-// isClosed reports whether the device is closed (or is closing).
-// See device.state.state comments for how to interpret this value.
-func (device *Device) isClosed() bool {
-	return device.deviceState() == deviceStateClosed
-}
-
-// isUp reports whether the device is up (or is attempting to come up).
-// See device.state.state comments for how to interpret this value.
-func (device *Device) isUp() bool {
-	return device.deviceState() == deviceStateUp
+func (d *Device) RunGrpcServer() error {
+	return nil
+	/*
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+	*/
 }
 
 // Must hold device.peers.Lock()
 func removePeerLocked(device *Device, peer *Peer, key NoisePublicKey) {
 	// stop routing and processing of packets
-	device.allowedips.RemoveByPeer(peer)
 	peer.Stop()
 
 	// remove from peer map
 	delete(device.peers.keyMap, key)
-}
-
-// changeState attempts to change the device state to match want.
-func (device *Device) changeState(want deviceState) (err error) {
-	device.state.Lock()
-	defer device.state.Unlock()
-	old := device.deviceState()
-	if old == deviceStateClosed {
-		// once closed, always closed
-		device.log.Verbosef("Interface closed, ignored requested state %s", want)
-		return nil
-	}
-	switch want {
-	case old:
-		return nil
-	case deviceStateUp:
-		device.state.state.Store(uint32(deviceStateUp))
-		err = device.upLocked()
-		if err == nil {
-			break
-		}
-		fallthrough // up failed; bring the device all the way back down
-	case deviceStateDown:
-		device.state.state.Store(uint32(deviceStateDown))
-		errDown := device.downLocked()
-		if err == nil {
-			err = errDown
-		}
-	}
-	device.log.Verbosef("Interface state was %s, requested %s, now %s", old, want, device.deviceState())
-	return
-}
-
-// upLocked attempts to bring the device up and reports whether it succeeded.
-// The caller must hold device.state.mu and is responsible for updating device.state.state.
-func (device *Device) upLocked() error {
-	if err := device.BindUpdate(); err != nil {
-		device.log.Errorf("Unable to update bind: %v", err)
-		return err
-	}
-
-	// The IPC set operation waits for peers to be created before calling Start() on them,
-	// so if there's a concurrent IPC set request happening, we should wait for it to complete.
-	device.ipcMutex.Lock()
-	defer device.ipcMutex.Unlock()
-
-	device.peers.RLock()
-	for _, peer := range device.peers.keyMap {
-		peer.Start()
-		if peer.persistentKeepaliveInterval.Load() > 0 {
-			peer.SendKeepalive()
-		}
-	}
-	device.peers.RUnlock()
-	return nil
 }
 
 // downLocked attempts to bring the device down.
@@ -204,14 +108,6 @@ func (device *Device) downLocked() error {
 	}
 	device.peers.RUnlock()
 	return err
-}
-
-func (device *Device) Up() error {
-	return device.changeState(deviceStateUp)
-}
-
-func (device *Device) Down() error {
-	return device.changeState(deviceStateDown)
 }
 
 func (device *Device) IsUnderLoad() bool {
@@ -281,19 +177,11 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 	return nil
 }
 
-func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
+func NewDevice(bind conn.Bind, logger *Logger, config *EnvConfig) *Device {
 	device := new(Device)
-	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
 	device.log = logger
 	device.net.bind = bind
-	device.tun.device = tunDevice
-	mtu, err := device.tun.device.MTU()
-	if err != nil {
-		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
-		mtu = DefaultMTU
-	}
-	device.tun.mtu.Store(int32(mtu))
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
 	device.rate.limiter.Init()
 	device.indexTable.Init()
@@ -309,7 +197,6 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	// start workers
 
 	cpus := runtime.NumCPU()
-	device.state.stopping.Wait()
 	device.queue.encryption.wg.Add(cpus) // One for each RoutineHandshake
 	for i := 0; i < cpus; i++ {
 		go device.RoutineEncryption(i + 1)
@@ -317,10 +204,49 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 		go device.RoutineHandshake(i + 1)
 	}
 
-	device.state.stopping.Add(1)      // RoutineReadFromTUN
 	device.queue.encryption.wg.Add(1) // RoutineReadFromTUN
-	go device.RoutineReadFromTUN()
-	go device.RoutineTUNEventReader()
+
+	device.metricsPeersCountTotal = promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "peer_count_total",
+		Help: "Total number of peers with active session",
+	}, device.CountPeers)
+	device.metricsPeersActiveTotal = promauto.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "peer_active_total",
+		Help: "Total number of peers with active session",
+	}, device.CountPeersWithValidSessions)
+	device.metricsHandshakesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "peer_handshakes_total",
+		Help: "Number of handshakes seen so far",
+	})
+	device.metricsKeepalivesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "peer_keepalives_total",
+		Help: "Number of keepalives seen so far",
+	})
+	device.metricsDiscardedPackets = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "wireguard_discarded_packets",
+		Help: "Number of discarded packets with IP payload",
+	}, []string{"family"})
+
+	device.EnvConfig = config
+
+	var sk NoisePrivateKey
+	err := sk.FromMaybeZeroHex(device.EnvConfig.PrivateKey)
+	if err != nil {
+		device.log.Errorf("failed to set private_key: %q", err)
+		return nil
+	}
+	device.SetPrivateKey(sk)
+
+	device.net.Lock()
+	device.net.port = device.EnvConfig.ListenPort
+	device.net.Unlock()
+
+	device.GrpcServer = &EventServer{
+		PeerSeenEventCh:       make(chan *pb.PeerSeenEvent),
+		PeerSeenEventWatchers: make(map[string]chan *pb.PeerSeenEvent),
+		log:                   NewLogger(LogLevelVerbose, "(grpc) "),
+	}
+	go device.GrpcServer.Run(device.EnvConfig.GrpcListenAddress)
 
 	return device
 }
@@ -331,21 +257,31 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 // the lifetime of the device.
 func (device *Device) BatchSize() int {
 	size := device.net.bind.BatchSize()
-	dSize := device.tun.device.BatchSize()
-	if size < dSize {
-		size = dSize
-	}
 	return size
 }
 
 func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
 	device.peers.RLock()
-	defer device.peers.RUnlock()
+	peer := device.peers.keyMap[pk]
+	device.peers.RUnlock()
 
-	return device.peers.keyMap[pk]
+	if peer == nil && device.EnvConfig.OpenPeering {
+		device.log.Verbosef("peer not found, adding")
+		var err error
+		peer, err = device.NewPeer(pk)
+		if err != nil {
+			device.log.Errorf("could not add peer: %q", err)
+		}
+		device.log.Verbosef("added peer: %#v", peer)
+		peer.Start()
+		peer.SendStagedPackets()
+	}
+
+	return peer
 }
 
 func (device *Device) RemovePeer(key NoisePublicKey) {
+	device.log.Verbosef("RemovePeer adding lock")
 	device.peers.Lock()
 	defer device.peers.Unlock()
 	// stop peer and remove from routing
@@ -354,6 +290,7 @@ func (device *Device) RemovePeer(key NoisePublicKey) {
 	if ok {
 		removePeerLocked(device, peer, key)
 	}
+	device.log.Verbosef("RemovePeer removing lock")
 }
 
 func (device *Device) RemoveAllPeers() {
@@ -368,17 +305,10 @@ func (device *Device) RemoveAllPeers() {
 }
 
 func (device *Device) Close() {
-	device.state.Lock()
-	defer device.state.Unlock()
 	device.ipcMutex.Lock()
 	defer device.ipcMutex.Unlock()
-	if device.isClosed() {
-		return
-	}
-	device.state.state.Store(uint32(deviceStateClosed))
 	device.log.Verbosef("Device closing")
 
-	device.tun.device.Close()
 	device.downLocked()
 
 	// Remove peers before closing queues,
@@ -391,7 +321,6 @@ func (device *Device) Close() {
 	device.queue.encryption.wg.Done()
 	device.queue.decryption.wg.Done()
 	device.queue.handshake.wg.Done()
-	device.state.stopping.Wait()
 
 	device.rate.limiter.Close()
 
@@ -404,10 +333,6 @@ func (device *Device) Wait() chan struct{} {
 }
 
 func (device *Device) SendKeepalivesToPeersWithCurrentKeypair() {
-	if !device.isUp() {
-		return
-	}
-
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
 		peer.keypairs.RLock()
@@ -452,7 +377,7 @@ func (device *Device) BindSetMark(mark uint32) error {
 
 	// update fwmark on existing bind
 	device.net.fwmark = mark
-	if device.isUp() && device.net.bind != nil {
+	if device.net.bind != nil {
 		if err := device.net.bind.SetMark(mark); err != nil {
 			return err
 		}
@@ -475,11 +400,6 @@ func (device *Device) BindUpdate() error {
 	// close existing sockets
 	if err := closeBindLocked(device); err != nil {
 		return err
-	}
-
-	// open new sockets
-	if !device.isUp() {
-		return nil
 	}
 
 	// bind to new port

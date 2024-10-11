@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,11 +48,15 @@ var byteBufferPool = &sync.Pool{
 // IpcGetOperation implements the WireGuard configuration protocol "get" operation.
 // See https://www.wireguard.com/xplatform/#configuration-protocol for details.
 func (device *Device) IpcGetOperation(w io.Writer) error {
+	device.log.Verbosef("ipcget 1")
 	device.ipcMutex.RLock()
 	defer device.ipcMutex.RUnlock()
 
+	device.log.Verbosef("ipcget 2")
 	buf := byteBufferPool.Get().(*bytes.Buffer)
+	device.log.Verbosef("ipcget 3")
 	buf.Reset()
+	device.log.Verbosef("ipcget 4")
 	defer byteBufferPool.Put(buf)
 	sendf := func(format string, args ...any) {
 		fmt.Fprintf(buf, format, args...)
@@ -74,15 +77,22 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 	func() {
 		// lock required resources
 
+		device.log.Verbosef("ipcget net lock")
 		device.net.RLock()
 		defer device.net.RUnlock()
 
+		device.log.Verbosef("ipcget static identity lock")
 		device.staticIdentity.RLock()
 		defer device.staticIdentity.RUnlock()
 
-		device.peers.RLock()
+		device.log.Verbosef("ipcget peers lock")
+		//		device.peers.RLock()
+		if locked := device.peers.TryRLock(); !locked {
+			device.log.Errorf("could not get peer lock")
+		}
 		defer device.peers.RUnlock()
 
+		device.log.Verbosef("finished with locks")
 		// serialize device related values
 
 		if !device.staticIdentity.privateKey.IsZero() {
@@ -98,6 +108,7 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 		}
 
 		for _, peer := range device.peers.keyMap {
+			device.log.Verbosef("iterating peers")
 			// Serialize peer state.
 			peer.handshake.mutex.RLock()
 			keyf("public_key", (*[32]byte)(&peer.handshake.remoteStatic))
@@ -118,19 +129,18 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			sendf("last_handshake_time_nsec=%d", nano)
 			sendf("tx_bytes=%d", peer.txBytes.Load())
 			sendf("rx_bytes=%d", peer.rxBytes.Load())
+			sendf("rx_discarded_ipv4_packets=%d", peer.rxDiscardedIpv4Packets.Load())
+			sendf("rx_discarded_ipv6_packets=%d", peer.rxDiscardedIpv6Packets.Load())
 			sendf("persistent_keepalive_interval=%d", peer.persistentKeepaliveInterval.Load())
-
-			device.allowedips.EntriesForPeer(peer, func(prefix netip.Prefix) bool {
-				sendf("allowed_ip=%s", prefix.String())
-				return true
-			})
 		}
 	}()
 
+	device.log.Verbosef("sending lines")
 	// send lines (does not require resource locks)
 	if _, err := w.Write(buf.Bytes()); err != nil {
 		return ipcErrorf(ipc.IpcErrorIO, "failed to write output: %w", err)
 	}
+	device.log.Verbosef("returning")
 
 	return nil
 }
@@ -262,13 +272,11 @@ func (peer *ipcSetPeer) handlePostConfig() {
 	if peer.created {
 		peer.endpoint.disableRoaming = peer.device.net.brokenRoaming && peer.endpoint.val != nil
 	}
-	if peer.device.isUp() {
-		peer.Start()
-		if peer.pkaOn {
-			peer.SendKeepalive()
-		}
-		peer.SendStagedPackets()
+	peer.Start()
+	if peer.pkaOn {
+		peer.SendKeepalive()
 	}
+	peer.SendStagedPackets()
 }
 
 func (device *Device) handlePublicKeyLine(peer *ipcSetPeer, value string) error {
@@ -359,27 +367,6 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error 
 
 		// Send immediate keepalive if we're turning it on and before it wasn't on.
 		peer.pkaOn = old == 0 && secs != 0
-
-	case "replace_allowed_ips":
-		device.log.Verbosef("%v - UAPI: Removing all allowedips", peer.Peer)
-		if value != "true" {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to replace allowedips, invalid value: %v", value)
-		}
-		if peer.dummy {
-			return nil
-		}
-		device.allowedips.RemoveByPeer(peer.Peer)
-
-	case "allowed_ip":
-		device.log.Verbosef("%v - UAPI: Adding allowedip", peer.Peer)
-		prefix, err := netip.ParsePrefix(value)
-		if err != nil {
-			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set allowed ip: %w", err)
-		}
-		if peer.dummy {
-			return nil
-		}
-		device.allowedips.Insert(prefix, peer.Peer)
 
 	case "protocol_version":
 		if value != "1" {

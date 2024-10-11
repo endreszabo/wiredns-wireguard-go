@@ -6,7 +6,6 @@
 package device
 
 import (
-	"container/list"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -16,14 +15,16 @@ import (
 )
 
 type Peer struct {
-	isRunning         atomic.Bool
-	keypairs          Keypairs
-	handshake         Handshake
-	device            *Device
-	stopping          sync.WaitGroup // routines pending stop
-	txBytes           atomic.Uint64  // bytes send to peer (endpoint)
-	rxBytes           atomic.Uint64  // bytes received from peer
-	lastHandshakeNano atomic.Int64   // nano seconds since epoch
+	isRunning              atomic.Bool
+	keypairs               Keypairs
+	handshake              Handshake
+	device                 *Device
+	stopping               sync.WaitGroup // routines pending stop
+	txBytes                atomic.Uint64  // bytes send to peer (endpoint)
+	rxBytes                atomic.Uint64  // bytes received from peer
+	rxDiscardedIpv4Packets atomic.Uint64
+	rxDiscardedIpv6Packets atomic.Uint64
+	lastHandshakeNano      atomic.Int64 // nano seconds since epoch
 
 	endpoint struct {
 		sync.Mutex
@@ -54,15 +55,10 @@ type Peer struct {
 	}
 
 	cookieGenerator             CookieGenerator
-	trieEntries                 list.List
 	persistentKeepaliveInterval atomic.Uint32
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
-	if device.isClosed() {
-		return nil, errors.New("device closed")
-	}
-
 	// lock resources
 	device.staticIdentity.RLock()
 	defer device.staticIdentity.RUnlock()
@@ -107,7 +103,6 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	// init timers
 	peer.timersInit()
 
-	// add
 	device.peers.keyMap[pk] = peer
 
 	return peer, nil
@@ -116,10 +111,6 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	peer.device.net.RLock()
 	defer peer.device.net.RUnlock()
-
-	if peer.device.isClosed() {
-		return nil
-	}
 
 	peer.endpoint.Lock()
 	endpoint := peer.endpoint.val
@@ -171,11 +162,6 @@ func (peer *Peer) String() string {
 }
 
 func (peer *Peer) Start() {
-	// should never start a peer on a closed device
-	if peer.device.isClosed() {
-		return
-	}
-
 	// prevent simultaneous start/stop operations
 	peer.state.Lock()
 	defer peer.state.Unlock()
@@ -209,6 +195,10 @@ func (peer *Peer) Start() {
 	go peer.RoutineSequentialReceiver(batchSize)
 
 	peer.isRunning.Store(true)
+}
+
+func (peer *Peer) HasValidKeypair() bool {
+	return peer.keypairs.current != nil
 }
 
 func (peer *Peer) ZeroAndFlushAll() {
@@ -268,6 +258,7 @@ func (peer *Peer) Stop() {
 
 	peer.timersStop()
 	// Signal that RoutineSequentialSender and RoutineSequentialReceiver should exit.
+
 	peer.queue.inbound.c <- nil
 	peer.queue.outbound.c <- nil
 	peer.stopping.Wait()

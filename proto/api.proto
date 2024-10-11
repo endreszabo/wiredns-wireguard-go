@@ -1,0 +1,26 @@
+syntax = "proto3";
+import "google/protobuf/empty.proto";
+
+//option go_package = "git.y7.hu/Y7/coredns_redns/api";
+option go_package = "github.com/endreszabo/wiredns-wireguard-go/proto";
+import "google/protobuf/timestamp.proto";
+
+
+package y7_wiredns_sensor_v1;
+
+enum UpdateType {
+    Keepalive = 0;
+    Handshake = 1;
+    KeysExpired = 2;
+}
+
+message PeerSeenEvent {
+    bytes PublicKey = 1;
+    optional bytes Endpoint = 2;
+    google.protobuf.Timestamp Timestamp = 3;
+    UpdateType UpdateType = 4;
+}
+
+service EventEmitter {
+    rpc Emit(google.protobuf.Empty) returns (stream PeerSeenEvent);
+}

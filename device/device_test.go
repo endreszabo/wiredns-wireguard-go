@@ -172,11 +172,6 @@ func genTestPair(tb testing.TB, realSocket bool) (pair testPair) {
 			p.dev.Close()
 			continue
 		}
-		if err := p.dev.Up(); err != nil {
-			tb.Errorf("failed to bring up device %d: %v", i, err)
-			p.dev.Close()
-			continue
-		}
 		endpointCfg[i^1] = fmt.Sprintf(endpointCfg[i^1], p.dev.net.port)
 	}
 	for i := range pair {
@@ -221,20 +216,12 @@ func TestUpDown(t *testing.T) {
 			go func(d *Device) {
 				defer wg.Done()
 				for i := 0; i < itrials; i++ {
-					if err := d.Up(); err != nil {
-						t.Errorf("failed up bring up device: %v", err)
-					}
-					time.Sleep(time.Duration(rand.Intn(int(time.Nanosecond * (0x10000 - 1)))))
-					if err := d.Down(); err != nil {
-						t.Errorf("failed to bring down device: %v", err)
-					}
 					time.Sleep(time.Duration(rand.Intn(int(time.Nanosecond * (0x10000 - 1)))))
 				}
 			}(pair[i].dev)
 		}
 		wg.Wait()
 		for i := range pair {
-			pair[i].dev.Up()
 			pair[i].dev.Close()
 		}
 	}
@@ -446,31 +433,3 @@ func (t *fakeTUNDeviceSized) Name() (string, error)                        { ret
 func (t *fakeTUNDeviceSized) Events() <-chan tun.Event                     { return nil }
 func (t *fakeTUNDeviceSized) Close() error                                 { return nil }
 func (t *fakeTUNDeviceSized) BatchSize() int                               { return t.size }
-
-func TestBatchSize(t *testing.T) {
-	d := Device{}
-
-	d.net.bind = &fakeBindSized{1}
-	d.tun.device = &fakeTUNDeviceSized{1}
-	if want, got := 1, d.BatchSize(); got != want {
-		t.Errorf("expected batch size %d, got %d", want, got)
-	}
-
-	d.net.bind = &fakeBindSized{1}
-	d.tun.device = &fakeTUNDeviceSized{128}
-	if want, got := 128, d.BatchSize(); got != want {
-		t.Errorf("expected batch size %d, got %d", want, got)
-	}
-
-	d.net.bind = &fakeBindSized{128}
-	d.tun.device = &fakeTUNDeviceSized{1}
-	if want, got := 128, d.BatchSize(); got != want {
-		t.Errorf("expected batch size %d, got %d", want, got)
-	}
-
-	d.net.bind = &fakeBindSized{128}
-	d.tun.device = &fakeTUNDeviceSized{128}
-	if want, got := 128, d.BatchSize(); got != want {
-		t.Errorf("expected batch size %d, got %d", want, got)
-	}
-}

@@ -11,6 +11,10 @@ import (
 	"sync"
 	"time"
 	_ "unsafe"
+
+	pb "golang.zx2c4.com/wireguard/proto"
+
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 //go:linkname fastrandn runtime.fastrandn
@@ -73,7 +77,7 @@ func (timer *Timer) IsPending() bool {
 }
 
 func (peer *Peer) timersActive() bool {
-	return peer.isRunning.Load() && peer.device != nil && peer.device.isUp()
+	return peer.isRunning.Load() && peer.device != nil
 }
 
 func expiredRetransmitHandshake(peer *Peer) {
@@ -125,7 +129,16 @@ func expiredNewHandshake(peer *Peer) {
 
 func expiredZeroKeyMaterial(peer *Peer) {
 	peer.device.log.Verbosef("%s - Removing all keys, since we haven't received a new one in %d seconds", peer, int((RejectAfterTime * 3).Seconds()))
-	peer.ZeroAndFlushAll()
+	if peer.device.EnvConfig.OpenPeering {
+		peer.device.RemovePeer(peer.handshake.remoteStatic)
+	} else {
+		peer.ZeroAndFlushAll()
+	}
+	peer.device.GrpcServer.PeerSeenEventCh <- &pb.PeerSeenEvent{
+		PublicKey:  peer.handshake.remoteStatic[:],
+		Timestamp:  timestamppb.Now(),
+		UpdateType: pb.UpdateType_KeysExpired,
+	}
 }
 
 func expiredPersistentKeepalive(peer *Peer) {
@@ -216,6 +229,6 @@ func (peer *Peer) timersStop() {
 	peer.timers.retransmitHandshake.DelSync()
 	peer.timers.sendKeepalive.DelSync()
 	peer.timers.newHandshake.DelSync()
-	peer.timers.zeroKeyMaterial.DelSync()
+	peer.timers.zeroKeyMaterial.Del()
 	peer.timers.persistentKeepalive.DelSync()
 }

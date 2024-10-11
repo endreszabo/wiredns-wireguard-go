@@ -9,16 +9,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"net"
-	"os"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/tun"
 )
 
 /* Outbound flow
@@ -208,118 +203,6 @@ func (peer *Peer) keepKeyFreshSending() {
 	}
 }
 
-func (device *Device) RoutineReadFromTUN() {
-	defer func() {
-		device.log.Verbosef("Routine: TUN reader - stopped")
-		device.state.stopping.Done()
-		device.queue.encryption.wg.Done()
-	}()
-
-	device.log.Verbosef("Routine: TUN reader - started")
-
-	var (
-		batchSize   = device.BatchSize()
-		readErr     error
-		elems       = make([]*QueueOutboundElement, batchSize)
-		bufs        = make([][]byte, batchSize)
-		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
-		count       = 0
-		sizes       = make([]int, batchSize)
-		offset      = MessageTransportHeaderSize
-	)
-
-	for i := range elems {
-		elems[i] = device.NewOutboundElement()
-		bufs[i] = elems[i].buffer[:]
-	}
-
-	defer func() {
-		for _, elem := range elems {
-			if elem != nil {
-				device.PutMessageBuffer(elem.buffer)
-				device.PutOutboundElement(elem)
-			}
-		}
-	}()
-
-	for {
-		// read packets
-		count, readErr = device.tun.device.Read(bufs, sizes, offset)
-		for i := 0; i < count; i++ {
-			if sizes[i] < 1 {
-				continue
-			}
-
-			elem := elems[i]
-			elem.packet = bufs[i][offset : offset+sizes[i]]
-
-			// lookup peer
-			var peer *Peer
-			switch elem.packet[0] >> 4 {
-			case 4:
-				if len(elem.packet) < ipv4.HeaderLen {
-					continue
-				}
-				dst := elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
-				peer = device.allowedips.Lookup(dst)
-
-			case 6:
-				if len(elem.packet) < ipv6.HeaderLen {
-					continue
-				}
-				dst := elem.packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]
-				peer = device.allowedips.Lookup(dst)
-
-			default:
-				device.log.Verbosef("Received packet with unknown IP version")
-			}
-
-			if peer == nil {
-				continue
-			}
-			elemsForPeer, ok := elemsByPeer[peer]
-			if !ok {
-				elemsForPeer = device.GetOutboundElementsContainer()
-				elemsByPeer[peer] = elemsForPeer
-			}
-			elemsForPeer.elems = append(elemsForPeer.elems, elem)
-			elems[i] = device.NewOutboundElement()
-			bufs[i] = elems[i].buffer[:]
-		}
-
-		for peer, elemsForPeer := range elemsByPeer {
-			if peer.isRunning.Load() {
-				peer.StagePackets(elemsForPeer)
-				peer.SendStagedPackets()
-			} else {
-				for _, elem := range elemsForPeer.elems {
-					device.PutMessageBuffer(elem.buffer)
-					device.PutOutboundElement(elem)
-				}
-				device.PutOutboundElementsContainer(elemsForPeer)
-			}
-			delete(elemsByPeer, peer)
-		}
-
-		if readErr != nil {
-			if errors.Is(readErr, tun.ErrTooManySegments) {
-				// TODO: record stat for this
-				// This will happen if MSS is surprisingly small (< 576)
-				// coincident with reasonably high throughput.
-				device.log.Verbosef("Dropped some packets from multi-segment read: %v", readErr)
-				continue
-			}
-			if !device.isClosed() {
-				if !errors.Is(readErr, os.ErrClosed) {
-					device.log.Errorf("Failed to read packet from TUN device: %v", readErr)
-				}
-				go device.Close()
-			}
-			return
-		}
-	}
-}
-
 func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
 	for {
 		select {
@@ -341,7 +224,7 @@ func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
 
 func (peer *Peer) SendStagedPackets() {
 top:
-	if len(peer.queue.staged) == 0 || !peer.device.isUp() {
+	if len(peer.queue.staged) == 0 {
 		return
 	}
 
@@ -462,7 +345,7 @@ func (device *Device) RoutineEncryption(id int) {
 			binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
 
 			// pad content to multiple of 16
-			paddingSize := calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
+			paddingSize := calculatePaddingSize(len(elem.packet), 1400)
 			elem.packet = append(elem.packet, paddingZeros[:paddingSize]...)
 
 			// encrypt content and release to consumer
